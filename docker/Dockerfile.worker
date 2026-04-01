@@ -1,0 +1,43 @@
+# El worker usa la misma imagen base que la API.
+# En producción podrías tener workers con más CPU/RAM que la API,
+# escalados independientemente según la carga de ingesta de documentos.
+
+FROM python:3.11-slim as builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --user --no-cache-dir -r requirements.txt
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    # poppler-utils: necesario para pdf2image (convierte páginas PDF a imágenes)
+    poppler-utils \
+    # tesseract-ocr: motor OCR para PDFs sin texto seleccionable
+    # tesseract-ocr-spa: modelo de idioma español
+    # tesseract-ocr-eng: modelo de idioma inglés (suele venir por defecto)
+    tesseract-ocr \
+    tesseract-ocr-spa \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /root/.local /root/.local
+COPY . .
+
+ENV PATH=/root/.local/bin:$PATH
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+
+# El modelo de embeddings se descarga la primera vez que se usa.
+# Lo precargamos aquí para que no haya cold start en el primer job.
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+
+CMD ["celery", "-A", "app.workers.celery_app", "worker", "--loglevel=info", "--concurrency=2"]

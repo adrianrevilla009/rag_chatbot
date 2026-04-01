@@ -1,0 +1,45 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# DEPENDENCIAS Y POR QUÉ CADA UNA
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ─── API Framework ────────────────────────────────────────────────────────
+fastapi==0.111.0          # Framework async. Genera OpenAPI/Swagger automáticamente.
+uvicorn[standard]==0.29.0  # Servidor ASGI. "standard" incluye websockets y watchfiles.
+
+# ─── Base de datos ────────────────────────────────────────────────────────
+asyncpg==0.29.0           # Driver PostgreSQL ASYNC. Mucho más rápido que psycopg2 en async.
+psycopg2-binary==2.9.9    # Driver síncrono. Celery (síncrono) lo necesita.
+sqlalchemy[asyncio]==2.0.30  # ORM. La versión 2.0 soporta async nativamente.
+alembic==1.13.1           # Migraciones de base de datos. Para evolucionar el esquema sin perder datos.
+
+# ─── Cache y cola de mensajes ─────────────────────────────────────────────
+redis==5.0.4              # Cliente Python para Redis
+celery==5.4.0             # Worker de tareas async. Usa Redis como broker.
+flower==2.0.1             # Dashboard web para monitorear Celery (opcional pero útil)
+
+# ─── RAG Core ─────────────────────────────────────────────────────────────
+langchain==0.2.1                    # Orquestación del pipeline RAG
+langchain-community==0.2.1          # Integraciones (Groq, pgvector, etc.)
+langchain-groq==0.1.4               # Integración específica con Groq API
+pgvector==0.2.5                     # Driver Python para el tipo vector de pgvector
+
+# ─── Embeddings (local, sin coste) ────────────────────────────────────────
+sentence-transformers==3.0.1  # all-MiniLM-L6-v2: 384 dims, ~90MB RAM, muy rápido en CPU
+torch==2.3.0                  # Backend de sentence-transformers (CPU-only por defecto)
+
+# ─── Procesamiento de documentos ──────────────────────────────────────────
+pypdf==4.2.0              # Extrae texto de PDFs con texto seleccionable.
+pdf2image==1.17.0         # Convierte páginas PDF a imágenes (necesita poppler en el SO)
+pytesseract==0.3.13       # OCR con Tesseract: fallback para PDFs escaneados o de Canva
+python-docx==1.1.0        # Lee archivos .docx (Word)
+python-multipart==0.0.9   # Para recibir archivos en FastAPI (multipart/form-data)
+
+# ─── Utilidades ───────────────────────────────────────────────────────────
+pydantic==2.7.1           # Validación de datos. FastAPI lo usa internamente.
+pydantic-settings==2.3.0  # Leer configuración desde .env con tipado
+python-dotenv==1.0.1      # Cargar variables de entorno desde .env
+httpx==0.27.0             # Cliente HTTP async (para llamadas a Groq si es necesario)
+tenacity==8.3.0           # Reintentos con backoff exponencial. Esencial en producción
+                          # para manejar rate limits y errores transitorios de red.
+structlog==24.2.0         # Logging estructurado en JSON. En producción los logs
+                          # los procesa Elasticsearch/Datadog/CloudWatch — necesitan JSON.

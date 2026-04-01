@@ -1,0 +1,53 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# DOCKERFILE DE LA API
+#
+# Usamos multi-stage build: una etapa para instalar dependencias (con gcc,
+# headers, etc.) y otra limpia solo con lo necesario para correr.
+# Resultado: imagen ~40% más pequeña y sin herramientas de compilación expuestas.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ─── Etapa 1: Builder ─────────────────────────────────────────────────────
+FROM python:3.11-slim as builder
+
+WORKDIR /build
+
+# Instalar dependencias del sistema necesarias para compilar algunas libs Python
+# (psycopg2 necesita libpq-dev, sentence-transformers necesita build-essential)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --user --no-cache-dir -r requirements.txt
+
+# ─── Etapa 2: Runtime ─────────────────────────────────────────────────────
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Solo las libs de runtime (no compiladores)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    poppler-utils \
+    tesseract-ocr \
+    tesseract-ocr-spa \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copiar solo los paquetes Python instalados
+COPY --from=builder /root/.local /root/.local
+
+COPY . .
+
+ENV PATH=/root/.local/bin:$PATH
+ENV PYTHONPATH=/app
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+# PYTHONUNBUFFERED=1: los logs aparecen inmediatamente en docker logs
+# sin este flag, Python hace buffer y los logs se pierden en crashes
+
+EXPOSE 8000
+
+# uvicorn: servidor ASGI de producción para FastAPI
+# --reload solo en desarrollo (recarga cuando cambias código)
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
