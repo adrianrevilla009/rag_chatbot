@@ -1,73 +1,115 @@
 """
-PIPELINE RAG COMPLETO
-======================
-Este es el fichero más importante del proyecto. Aquí se orquesta el patrón RAG:
+AGENTIC RAG — ITERACIÓN 2
+==========================
+El agente decide qué herramientas usar antes de responder.
 
-  1. RETRIEVE: Buscar los chunks más relevantes para la pregunta
-  2. AUGMENT:  Construir el prompt con esos chunks como contexto
-  3. GENERATE: Enviar el prompt al LLM y obtener la respuesta
+FLUJO DEL AGENTE:
+    1. LLM recibe pregunta + tools disponibles (JSON Schema)
+    2. LLM responde con tool_calls (qué tools quiere usar y con qué args)
+    3. Ejecutamos las tools y devolvemos resultados al LLM como role=tool
+    4. LLM sintetiza la respuesta final
 
-Sin RAG: LLM responde con su conocimiento de entrenamiento (puede alucinar
-         sobre documentos que no conoce).
+POR QUÉ NO USAMOS LangChain AgentExecutor:
+Implementamos el loop manualmente con la API nativa de Groq.
+Así el código es transparente y entiendes exactamente qué ocurre.
 
-Con RAG: LLM recibe el contexto real de los documentos y solo tiene que
-         sintetizar la respuesta. Mucho más fiable y actualizable.
-
-FLUJO COMPLETO:
-    pregunta del usuario
-         ↓
-    embedding de la pregunta
-         ↓
-    búsqueda vectorial en pgvector → top 5 chunks más similares
-         ↓
-    construcción del prompt con los chunks
-         ↓
-    llamada a Groq (LLaMA 3.3 70B)
-         ↓
-    respuesta + fuentes citadas
+NOTA SOBRE GROQ Y TOOL CALLS:
+Groq es estricto con el formato del historial cuando hay tool_calls.
+El mensaje assistant con tool_calls debe pasarse usando el objeto
+nativo de la respuesta (.model_dump()), NO construido a mano como dict.
+Construirlo a mano con campos que no coinciden exactamente con lo que
+Groq espera provoca BadRequestError.
 """
 
+import json
 import uuid
-from typing import AsyncGenerator
 
 from groq import AsyncGroq
 from sqlalchemy.ext.asyncio import AsyncSession
-from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.services.cache_service import get_cache_service
 from app.services.embedding_service import get_embedding_service
 from app.services.vector_store import get_vector_store
+from app.services.web_search_service import get_web_search_service
 
 logger = get_logger(__name__)
 
-# El system prompt define el comportamiento del LLM
-# En producción esto lo tendrías en base de datos para poder cambiarlo sin deploy
-SYSTEM_PROMPT = """Eres un asistente experto en análisis de documentos.
-Los documentos pueden estar en cualquier idioma. Responde siempre en el idioma de la pregunta.
-Tu función es responder preguntas basándote EXCLUSIVAMENTE en el contexto proporcionado.
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_documents",
+            "description": (
+                "Busca información en los documentos locales que el usuario ha subido. "
+                "Usa esta tool PRIMERO cuando la pregunta pueda estar respondida "
+                "por los documentos disponibles (CVs, informes, manuales, contratos, etc.). "
+                "Devuelve fragmentos relevantes con su puntuación de similitud."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "La consulta de búsqueda. Debe ser específica y en inglés "
+                            "si los documentos están en inglés, para mejor similitud semántica."
+                        ),
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": (
+                "Busca información actualizada en internet usando DuckDuckGo. "
+                "Usa esta tool cuando: (1) la información no está en los documentos, "
+                "(2) necesitas datos actuales (precios, noticias, estadísticas recientes), "
+                "(3) el usuario pregunta sobre algo externo a los documentos. "
+                "NO uses esta tool si search_documents ya ha dado una respuesta suficiente."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "La consulta de búsqueda web. Sé específico.",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+]
 
-Reglas:
-1. Si la respuesta está en el contexto, responde de forma clara y precisa.
-2. Si la información NO está en el contexto, di explícitamente: "No encuentro información sobre eso en los documentos disponibles."
-3. NUNCA inventes información que no esté en el contexto.
-4. Cita siempre el documento y página de donde proviene la información.
-5. Si hay información contradictoria en distintos documentos, señálalo.
-6. Responde en el mismo idioma que la pregunta.
+AGENT_SYSTEM_PROMPT = """Eres un asistente inteligente con acceso a dos fuentes de información:
+1. Documentos locales del usuario (CVs, informes, contratos, etc.)
+2. Búsqueda web en tiempo real (DuckDuckGo)
 
-Formato de respuesta:
-- Respuesta directa y concisa
-- Si aplica, menciona: "Fuente: [nombre del documento], página [X]"
-"""
+ESTRATEGIA:
+- Usa search_documents primero si la pregunta puede estar en los documentos.
+- Usa search_web si necesitas información externa o actualizada.
+- Puedes usar ambas tools si es necesario.
+- Si ninguna tool da información relevante, responde con lo que sabes.
+
+FORMATO:
+- Responde siempre en el idioma de la pregunta.
+- Cita las fuentes: "Según [documento/web]..."
+- Sé conciso y directo."""
 
 
-class RAGService:
+class AgenticRAGService:
 
     def __init__(self):
         self.embedding_service = get_embedding_service()
         self.vector_store = get_vector_store()
         self.cache_service = get_cache_service()
+        self.web_search = get_web_search_service()
         self.groq_client = AsyncGroq(api_key=settings.groq_api_key)
 
     async def chat(
@@ -77,182 +119,191 @@ class RAGService:
         conversation_history: list[dict] | None = None,
         document_ids: list[uuid.UUID] | None = None,
     ) -> dict:
-        """
-        Punto de entrada principal del chatbot.
-
-        Parámetros:
-        - question: la pregunta del usuario
-        - conversation_history: mensajes anteriores (para mantener contexto)
-        - document_ids: limitar la búsqueda a documentos específicos
-
-        Retorna:
-        {
-            "answer": str,           # respuesta del LLM
-            "sources": list[dict],   # chunks usados (para citar fuentes)
-            "cached": bool,          # si vino de caché
-        }
-        """
         doc_ids_str = [str(did) for did in document_ids] if document_ids else None
 
-        # 1. Intentar caché primero
         cached = await self.cache_service.get(question, doc_ids_str)
         if cached:
             cached["cached"] = True
             return cached
 
-        # 2. RETRIEVE: Buscar chunks relevantes
-        relevant_chunks = await self._retrieve(db, question, document_ids)
-
-        if not relevant_chunks:
-            return {
-                "answer": "No encuentro información relevante en los documentos disponibles. ¿Puedes reformular tu pregunta o subir documentos relacionados?",
-                "sources": [],
-                "cached": False,
-            }
-
-        # 3. AUGMENT: Construir el contexto para el LLM
-        context = self._build_context(relevant_chunks)
-
-        # 4. GENERATE: Llamar al LLM
-        answer = await self._generate(question, context, conversation_history)
+        answer, sources, tools_used = await self._agent_loop(
+            db=db,
+            question=question,
+            conversation_history=conversation_history,
+            document_ids=document_ids,
+        )
 
         response = {
             "answer": answer,
-            "sources": [
-                {
-                    "chunk_id": chunk["id"],
-                    "filename": chunk["filename"],
-                    "page_number": chunk.get("page_number"),
-                    "score": round(chunk["score"], 3),
-                    "excerpt": chunk["content"][:200] + "..." if len(chunk["content"]) > 200 else chunk["content"],
-                }
-                for chunk in relevant_chunks
-            ],
+            "sources": sources,
             "cached": False,
+            "tools_used": tools_used,
         }
 
-        # 5. Guardar en caché para próximas peticiones iguales
         await self.cache_service.set(question, response, doc_ids_str)
-
         return response
 
-    async def _retrieve(
+    async def _agent_loop(
         self,
         db: AsyncSession,
         question: str,
-        document_ids: list[uuid.UUID] | None = None,
-    ) -> list[dict]:
+        conversation_history: list[dict] | None,
+        document_ids: list[uuid.UUID] | None,
+    ) -> tuple[str, list[dict], list[str]]:
         """
-        RETRIEVE: Convierte la pregunta en embedding y busca chunks similares.
+        Loop agéntico ReAct simplificado.
 
-        ¿Por qué embebemos la pregunta con el mismo modelo que los chunks?
-        Porque los embeddings solo son comparables si fueron generados con
-        el mismo modelo. Mezclar modelos daría resultados sin sentido.
+        CLAVE: para el historial de mensajes con tool_calls, NO construimos
+        dicts a mano. Usamos msg.model_dump() del objeto de respuesta de Groq
+        para garantizar que el formato es exactamente el que Groq espera.
+        Groq valida estrictamente la estructura y rechaza campos incorrectos.
         """
-        logger.info("retrieving_chunks", question=question[:100])
+        messages = [{"role": "system", "content": AGENT_SYSTEM_PROMPT}]
 
-        # Embedding de la pregunta
-        query_embedding = self.embedding_service.embed_text(question)
+        if conversation_history:
+            messages.extend(conversation_history[-6:])
 
-        # Búsqueda vectorial
+        messages.append({"role": "user", "content": question})
+
+        all_sources = []
+        tools_used = []
+        max_iterations = 3
+
+        for iteration in range(max_iterations):
+            logger.info("agent_iteration", iteration=iteration + 1)
+
+            response = await self._call_groq_with_tools(messages)
+            msg = response.choices[0].message
+
+            if not msg.tool_calls:
+                # El LLM ha decidido responder directamente — fin del loop
+                logger.info("agent_finished", iteration=iteration + 1, tools_used=tools_used)
+                return msg.content or "", all_sources, tools_used
+
+            # Añadir mensaje del assistant al historial usando model_dump()
+            # Esto serializa el objeto Pydantic de Groq con exactamente los campos
+            # y el formato que Groq espera en la siguiente llamada.
+            # exclude_none=True: evita pasar campos null que Groq rechaza.
+            assistant_msg = msg.model_dump(exclude_none=True)
+            # Groq espera "content" aunque sea None — pero como string vacío
+            if "content" not in assistant_msg:
+                assistant_msg["content"] = ""
+            messages.append(assistant_msg)
+
+            # Ejecutar cada tool solicitada
+            for tool_call in msg.tool_calls:
+                tool_name = tool_call.function.name
+                tool_args = json.loads(tool_call.function.arguments)
+
+                logger.info("executing_tool", tool=tool_name, args=tool_args)
+                tools_used.append(tool_name)
+
+                if tool_name == "search_documents":
+                    result, sources = await self._tool_search_documents(
+                        db=db,
+                        query=tool_args["query"],
+                        document_ids=document_ids,
+                    )
+                    all_sources.extend(sources)
+                elif tool_name == "search_web":
+                    result = await self._tool_search_web(query=tool_args["query"])
+                else:
+                    result = f"Tool desconocida: {tool_name}"
+
+                # Mensaje role=tool: resultado de la tool para el LLM
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "name": tool_name,   # requerido por Groq junto a tool_call_id
+                    "content": result,
+                })
+
+        # Agotamos iteraciones — pedir síntesis final sin tools
+        logger.warning("agent_max_iterations_reached")
+        messages.append({
+            "role": "user",
+            "content": "Sintetiza la respuesta con la información recopilada."
+        })
+        final = await self._call_groq_with_tools(messages, use_tools=False)
+        return final.choices[0].message.content or "", all_sources, tools_used
+
+    async def _tool_search_documents(
+        self,
+        db: AsyncSession,
+        query: str,
+        document_ids: list[uuid.UUID] | None,
+    ) -> tuple[str, list[dict]]:
+        query_embedding = self.embedding_service.embed_text(query)
         chunks = await self.vector_store.similarity_search(
             db=db,
             query_embedding=query_embedding,
             document_ids=document_ids,
         )
 
-        logger.info("chunks_retrieved", count=len(chunks))
-        return chunks
+        if not chunks:
+            return "No se encontró información relevante en los documentos locales.", []
 
-    def _build_context(self, chunks: list[dict]) -> str:
-        """
-        AUGMENT: Construye el contexto que se incluirá en el prompt.
-
-        Ordenamos por chunk_index para que los fragmentos del mismo documento
-        aparezcan en orden lógico de lectura.
-        """
-        # Agrupar por documento para mejor legibilidad en el prompt
         docs: dict[str, list] = {}
         for chunk in chunks:
-            filename = chunk["filename"]
-            if filename not in docs:
-                docs[filename] = []
-            docs[filename].append(chunk)
+            docs.setdefault(chunk["filename"], []).append(chunk)
 
-        context_parts = []
+        parts = ["=== Resultados en documentos locales ==="]
         for filename, doc_chunks in docs.items():
-            # Ordenar chunks por posición en el documento
             doc_chunks.sort(key=lambda x: x["chunk_index"])
-
-            context_parts.append(f"=== Documento: {filename} ===")
+            parts.append(f"\n[Documento: {filename}]")
             for chunk in doc_chunks:
-                page_info = f" (página {chunk['page_number']})" if chunk.get("page_number") else ""
-                context_parts.append(f"[Relevancia: {chunk['score']:.2f}{page_info}]")
-                context_parts.append(chunk["content"])
-                context_parts.append("")
+                page = f" (pág. {chunk['page_number']})" if chunk.get("page_number") else ""
+                parts.append(f"Relevancia: {chunk['score']:.2f}{page}")
+                parts.append(chunk["content"])
 
-        return "\n".join(context_parts)
+        sources = [
+            {
+                "chunk_id": c["id"],
+                "filename": c["filename"],
+                "page_number": c.get("page_number"),
+                "score": round(c["score"], 3),
+                "excerpt": c["content"][:200] + "..." if len(c["content"]) > 200 else c["content"],
+                "source_type": "document",
+            }
+            for c in chunks
+        ]
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        # Reintenta hasta 3 veces con espera exponencial: 1s, 2s, 4s
-        # ¿Por qué? Los LLMs externos pueden fallar por rate limits o timeouts.
-        # En producción SIEMPRE tienes reintentos en llamadas a servicios externos.
-    )
-    async def _generate(
+        return "\n".join(parts), sources
+
+    async def _tool_search_web(self, query: str) -> str:
+        results = await self.web_search.search(query)
+        return self.web_search.format_for_llm(results, query)
+
+    async def _call_groq_with_tools(
         self,
-        question: str,
-        context: str,
-        conversation_history: list[dict] | None = None,
-    ) -> str:
-        """
-        GENERATE: Llama al LLM con el contexto recuperado.
+        messages: list[dict],
+        use_tools: bool = True,
+    ):
+        kwargs = {
+            "model": "openai/gpt-oss-120b",  # Modelo recomendado por Groq para tool calling
+            "messages": messages,
+            "max_tokens": 1024,
+            "temperature": 0.2,  # Groq recomienda 0.0-0.5 para tool calling
+        }
 
-        Construimos los mensajes siguiendo el formato de chat:
-        - system: instrucciones del asistente
-        - user/assistant: historial de conversación (para mantener contexto)
-        - user: pregunta actual con el contexto inyectado
-        """
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        if use_tools:
+            kwargs["tools"] = TOOLS
+            kwargs["tool_choice"] = "auto"
 
-        # Añadir historial de conversación (últimos 6 mensajes = 3 turnos)
-        # ¿Por qué limitar? Cada mensaje extra consume tokens y aumenta la latencia.
-        # 3 turnos de historial es suficiente para mantener contexto conversacional.
-        if conversation_history:
-            messages.extend(conversation_history[-6:])
-
-        # El prompt final: contexto + pregunta
-        user_message = f"""CONTEXTO DE LOS DOCUMENTOS:
-{context}
-
-PREGUNTA: {question}
-
-Responde basándote exclusivamente en el contexto anterior."""
-
-        messages.append({"role": "user", "content": user_message})
-
-        logger.info("calling_groq", model=settings.groq_model, messages=len(messages))
-
-        response = await self.groq_client.chat.completions.create(
-            model=settings.groq_model,
-            messages=messages,
-            max_tokens=1024,
-            temperature=0.1,
-            # temperature=0.1: casi determinista. Para RAG queremos respuestas
-            # consistentes, no creativas. Alta temperature → más alucinaciones.
+        response = await self.groq_client.chat.completions.create(**kwargs)
+        logger.info(
+            "groq_response",
+            tokens=response.usage.total_tokens,
+            tool_calls=len(response.choices[0].message.tool_calls or []),
         )
-
-        answer = response.choices[0].message.content
-        logger.info("groq_response_received", tokens=response.usage.total_tokens)
-        return answer
+        return response
 
 
-_rag_service: RAGService | None = None
+_rag_service: AgenticRAGService | None = None
 
 
-def get_rag_service() -> RAGService:
+def get_rag_service() -> AgenticRAGService:
     global _rag_service
     if _rag_service is None:
-        _rag_service = RAGService()
+        _rag_service = AgenticRAGService()
     return _rag_service

@@ -339,6 +339,22 @@
       border-radius: 2px;
       letter-spacing: 0.05em;
     }
+    .tool-badge {
+      font-size: 8px;
+      padding: 1px 6px;
+      border-radius: 2px;
+      letter-spacing: 0.05em;
+    }
+    .tool-badge-doc {
+      background: rgba(83, 155, 245, 0.12);
+      border: 1px solid var(--info);
+      color: var(--info);
+    }
+    .tool-badge-web {
+      background: rgba(227, 179, 65, 0.12);
+      border: 1px solid var(--warn);
+      color: var(--warn);
+    }
 
     .msg-content {
       font-family: var(--sans);
@@ -980,7 +996,7 @@ async function sendMessage() {
     state.conversationId = data.conversation_id;
     document.getElementById('convBadge').textContent = data.conversation_id.slice(0, 8);
 
-    appendMessage('assistant', data.answer, data.sources, data.cached);
+    appendMessage('assistant', data.answer, data.sources, data.cached, data.tools_used || []);
   } catch (e) {
     typing.remove();
     appendMessage('assistant', `⚠ Error: ${e.message}`);
@@ -990,7 +1006,7 @@ async function sendMessage() {
   }
 }
 
-function appendMessage(role, content, sources = [], cached = false) {
+function appendMessage(role, content, sources = [], cached = false, toolsUsed = []) {
   const container = document.getElementById('messages');
 
   const div = document.createElement('div');
@@ -1026,11 +1042,18 @@ function appendMessage(role, content, sources = [], cached = false) {
     ? '<span class="cached-badge">CACHED</span>'
     : '';
 
+  const toolsBadges = (toolsUsed || []).map(t => {
+    const label = t === 'search_documents' ? '📄 docs' : '🌐 web';
+    const cls   = t === 'search_web' ? 'tool-badge-web' : 'tool-badge-doc';
+    return `<span class="tool-badge ${cls}">${label}</span>`;
+  }).join('');
+
   div.innerHTML = `
     <div class="msg-header">
       <span class="msg-role ${role}">${role === 'user' ? '▸ USER' : '▸ ASSISTANT'}</span>
       <span class="msg-time">${time}</span>
       ${cachedBadge}
+      ${toolsBadges}
     </div>
     <div class="msg-content ${role === 'user' ? 'user-content' : ''}">${
       role === 'user' ? escHtml(content) : formatMarkdown(content)

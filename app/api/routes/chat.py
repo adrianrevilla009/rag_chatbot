@@ -103,6 +103,7 @@ async def chat(
         sources=result_data["sources"],
         conversation_id=conversation.id,
         cached=result_data["cached"],
+        tools_used=result_data.get("tools_used", []),
     )
 
 

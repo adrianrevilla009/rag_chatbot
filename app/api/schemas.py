@@ -96,6 +96,7 @@ class ChatResponse(BaseModel):
     sources: list[SourceResponse]
     conversation_id: uuid.UUID
     cached: bool = False
+    tools_used: list[str] = []  # qué tools usó el agente: search_documents, search_web
 
 
 # ─── Conversations ────────────────────────────────────────────────────────────

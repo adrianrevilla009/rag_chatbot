@@ -52,7 +52,10 @@ class Settings(BaseSettings):
 
     # ─── Groq ─────────────────────────────────────────────────────────────
     groq_api_key: str = Field(default="")
-    groq_model: str = Field(default="llama-3.3-70b-versatile")
+    groq_model: str = Field(default="openai/gpt-oss-120b")
+    # llama3-groq-70b-8192-tool-use-preview: modelo de Groq fine-tuneado
+    # específicamente para tool calling. llama-3.3-70b-versatile genera el
+    # tool call en formato <function=...> incorrecto en vez de JSON estándar.
     # llama-3.3-70b-versatile: el modelo más capaz de Groq en tier gratuito.
     # Para más velocidad puedes usar "llama-3.1-8b-instant" (peor calidad).
 
