@@ -39,9 +39,9 @@ pydantic==2.7.1           # Validación de datos. FastAPI lo usa internamente.
 pydantic-settings==2.3.0  # Leer configuración desde .env con tipado
 python-dotenv==1.0.1      # Cargar variables de entorno desde .env
 httpx==0.27.0             # Cliente HTTP async
-duckduckgo-search==6.2.1  # Web search gratuito sin API key. Hace scraping de DDG.
-                          # En Agentic RAG lo usa el agente cuando la info no está
-                          # en los documentos locales. (para llamadas a Groq si es necesario)
+duckduckgo-search==6.2.1  # Web search fallback si Tavily no está configurado
+tavily-python==0.3.9      # Búsqueda web de calidad para LLMs (recomendado)
+                          # Registro gratis en https://tavily.com
 tenacity==8.3.0           # Reintentos con backoff exponencial. Esencial en producción
                           # para manejar rate limits y errores transitorios de red.
 structlog==24.2.0         # Logging estructurado en JSON. En producción los logs

@@ -1,28 +1,24 @@
 """
-AGENTIC RAG — ITERACIÓN 2
+AGENTIC RAG — ITERACIÓN 4
 ==========================
-El agente decide qué herramientas usar antes de responder.
+Novedades respecto a v3:
+  - Hybrid search: pasa query_text al vector_store para BM25
+  - Citas inline: el prompt pide al LLM que cite [N] en su respuesta
+  - Las fuentes se numeran y se mandan con su índice al frontend
 
-FLUJO DEL AGENTE:
-    1. LLM recibe pregunta + tools disponibles (JSON Schema)
-    2. LLM responde con tool_calls (qué tools quiere usar y con qué args)
-    3. Ejecutamos las tools y devolvemos resultados al LLM como role=tool
-    4. LLM sintetiza la respuesta final
+CITAS INLINE:
+    El LLM recibe los chunks numerados [1], [2], [3]... en el contexto
+    y el system prompt le indica que cite el número correspondiente en
+    su respuesta. El frontend renderiza [1] como un superíndice clicable
+    que despliega el fragmento correspondiente.
 
-POR QUÉ NO USAMOS LangChain AgentExecutor:
-Implementamos el loop manualmente con la API nativa de Groq.
-Así el código es transparente y entiendes exactamente qué ocurre.
-
-NOTA SOBRE GROQ Y TOOL CALLS:
-Groq es estricto con el formato del historial cuando hay tool_calls.
-El mensaje assistant con tool_calls debe pasarse usando el objeto
-nativo de la respuesta (.model_dump()), NO construido a mano como dict.
-Construirlo a mano con campos que no coinciden exactamente con lo que
-Groq espera provoca BadRequestError.
+    Ejemplo de respuesta del LLM:
+    "El salario base es de 32.000€ anuales [1], con revisión anual [2]."
 """
 
 import json
 import uuid
+from collections.abc import AsyncGenerator
 
 from groq import AsyncGroq
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -45,7 +41,7 @@ TOOLS = [
                 "Busca información en los documentos locales que el usuario ha subido. "
                 "Usa esta tool PRIMERO cuando la pregunta pueda estar respondida "
                 "por los documentos disponibles (CVs, informes, manuales, contratos, etc.). "
-                "Devuelve fragmentos relevantes con su puntuación de similitud."
+                "Devuelve fragmentos relevantes numerados para que puedas citarlos."
             ),
             "parameters": {
                 "type": "object",
@@ -97,10 +93,18 @@ ESTRATEGIA:
 - Puedes usar ambas tools si es necesario.
 - Si ninguna tool da información relevante, responde con lo que sabes.
 
+CITAS INLINE — MUY IMPORTANTE:
+- Los resultados de search_documents vienen numerados: [1] fragmento, [2] fragmento, etc.
+- En tu respuesta DEBES citar el número de la fuente entre corchetes cada vez que uses información de un fragmento.
+- Ejemplo correcto: "El salario base es de 32.000€ [1], con revisión anual en enero [2]."
+- Ejemplo incorrecto: "El salario base es de 32.000€." (sin cita)
+- Para información de búsqueda web, escribe [web] en lugar de un número.
+- Si combinas varias fuentes en una frase: "...según el contrato [1][3]..."
+
 FORMATO:
 - Responde siempre en el idioma de la pregunta.
-- Cita las fuentes: "Según [documento/web]..."
-- Sé conciso y directo."""
+- Sé conciso y directo.
+- No incluyas una sección de "Referencias" al final — las citas inline son suficientes."""
 
 
 class AgenticRAGService:
@@ -143,6 +147,61 @@ class AgenticRAGService:
         await self.cache_service.set(question, response, doc_ids_str)
         return response
 
+    async def chat_stream(
+        self,
+        db: AsyncSession,
+        question: str,
+        conversation_history: list[dict] | None = None,
+        document_ids: list[uuid.UUID] | None = None,
+    ) -> AsyncGenerator[dict, None]:
+        """
+        Generator async SSE. Eventos:
+          {"type": "status",  "data": "..."}
+          {"type": "sources", "data": [...]}   ← fuentes numeradas
+          {"type": "token",   "data": "..."}
+          {"type": "done",    "data": {...}}
+          {"type": "error",   "data": "..."}
+        """
+        doc_ids_str = [str(did) for did in document_ids] if document_ids else None
+
+        cached = await self.cache_service.get(question, doc_ids_str)
+        if cached:
+            cached["cached"] = True
+            if cached.get("sources"):
+                yield {"type": "sources", "data": cached["sources"]}
+            for chunk in _split_into_chunks(cached["answer"]):
+                yield {"type": "token", "data": chunk}
+            yield {"type": "done", "data": {"tools_used": cached.get("tools_used", []), "cached": True}}
+            return
+
+        messages, all_sources, tools_used = await self._agent_loop_collect(
+            db=db,
+            question=question,
+            conversation_history=conversation_history,
+            document_ids=document_ids,
+        )
+
+        # Solo emitir fuentes si realmente se usó search_documents
+        # y el reranker dejó pasar algún chunk relevante
+        if all_sources and "search_documents" in tools_used:
+            yield {"type": "sources", "data": all_sources}
+
+        full_answer = ""
+        async for token in self._stream_final_answer(messages):
+            full_answer += token
+            yield {"type": "token", "data": token}
+
+        response = {
+            "answer": full_answer,
+            "sources": all_sources,
+            "cached": False,
+            "tools_used": tools_used,
+        }
+        await self.cache_service.set(question, response, doc_ids_str)
+        yield {"type": "done", "data": {"tools_used": tools_used, "cached": False}}
+
+    # ─── Agent loop ───────────────────────────────────────────────────────────
+
     async def _agent_loop(
         self,
         db: AsyncSession,
@@ -150,14 +209,22 @@ class AgenticRAGService:
         conversation_history: list[dict] | None,
         document_ids: list[uuid.UUID] | None,
     ) -> tuple[str, list[dict], list[str]]:
-        """
-        Loop agéntico ReAct simplificado.
+        messages, all_sources, tools_used = await self._agent_loop_collect(
+            db=db,
+            question=question,
+            conversation_history=conversation_history,
+            document_ids=document_ids,
+        )
+        final = await self._call_groq_with_tools(messages, use_tools=False)
+        return final.choices[0].message.content or "", all_sources, tools_used
 
-        CLAVE: para el historial de mensajes con tool_calls, NO construimos
-        dicts a mano. Usamos msg.model_dump() del objeto de respuesta de Groq
-        para garantizar que el formato es exactamente el que Groq espera.
-        Groq valida estrictamente la estructura y rechaza campos incorrectos.
-        """
+    async def _agent_loop_collect(
+        self,
+        db: AsyncSession,
+        question: str,
+        conversation_history: list[dict] | None,
+        document_ids: list[uuid.UUID] | None,
+    ) -> tuple[list[dict], list[dict], list[str]]:
         messages = [{"role": "system", "content": AGENT_SYSTEM_PROMPT}]
 
         if conversation_history:
@@ -165,8 +232,8 @@ class AgenticRAGService:
 
         messages.append({"role": "user", "content": question})
 
-        all_sources = []
-        tools_used = []
+        all_sources: list[dict] = []
+        tools_used: list[str] = []
         max_iterations = 3
 
         for iteration in range(max_iterations):
@@ -176,21 +243,15 @@ class AgenticRAGService:
             msg = response.choices[0].message
 
             if not msg.tool_calls:
-                # El LLM ha decidido responder directamente — fin del loop
-                logger.info("agent_finished", iteration=iteration + 1, tools_used=tools_used)
-                return msg.content or "", all_sources, tools_used
+                messages.append({"role": "assistant", "content": msg.content or ""})
+                messages.append({"_direct_answer": True, "_content": msg.content or ""})
+                return messages, all_sources, tools_used
 
-            # Añadir mensaje del assistant al historial usando model_dump()
-            # Esto serializa el objeto Pydantic de Groq con exactamente los campos
-            # y el formato que Groq espera en la siguiente llamada.
-            # exclude_none=True: evita pasar campos null que Groq rechaza.
             assistant_msg = msg.model_dump(exclude_none=True)
-            # Groq espera "content" aunque sea None — pero como string vacío
             if "content" not in assistant_msg:
                 assistant_msg["content"] = ""
             messages.append(assistant_msg)
 
-            # Ejecutar cada tool solicitada
             for tool_call in msg.tool_calls:
                 tool_name = tool_call.function.name
                 tool_args = json.loads(tool_call.function.arguments)
@@ -202,7 +263,9 @@ class AgenticRAGService:
                     result, sources = await self._tool_search_documents(
                         db=db,
                         query=tool_args["query"],
+                        original_question=question,
                         document_ids=document_ids,
+                        source_offset=len(all_sources),
                     )
                     all_sources.extend(sources)
                 elif tool_name == "search_web":
@@ -210,63 +273,72 @@ class AgenticRAGService:
                 else:
                     result = f"Tool desconocida: {tool_name}"
 
-                # Mensaje role=tool: resultado de la tool para el LLM
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "name": tool_name,   # requerido por Groq junto a tool_call_id
+                    "name": tool_name,
                     "content": result,
                 })
 
-        # Agotamos iteraciones — pedir síntesis final sin tools
         logger.warning("agent_max_iterations_reached")
         messages.append({
             "role": "user",
-            "content": "Sintetiza la respuesta con la información recopilada."
+            "content": "Sintetiza la respuesta con la información recopilada, citando las fuentes [N]."
         })
-        final = await self._call_groq_with_tools(messages, use_tools=False)
-        return final.choices[0].message.content or "", all_sources, tools_used
+        return messages, all_sources, tools_used
+
+    # ─── Tools ────────────────────────────────────────────────────────────────
 
     async def _tool_search_documents(
         self,
         db: AsyncSession,
         query: str,
+        original_question: str,
         document_ids: list[uuid.UUID] | None,
+        source_offset: int = 0,
     ) -> tuple[str, list[dict]]:
+        """
+        Hybrid search + reranking, con chunks numerados para citas inline.
+
+        source_offset: si ya hay fuentes de llamadas anteriores, los índices
+        continúan desde donde se dejaron (evitar [1] duplicados).
+        """
         query_embedding = self.embedding_service.embed_text(query)
         chunks = await self.vector_store.similarity_search(
             db=db,
             query_embedding=query_embedding,
+            query_text=original_question,   # ← para BM25 y reranker
             document_ids=document_ids,
         )
 
         if not chunks:
             return "No se encontró información relevante en los documentos locales.", []
 
-        docs: dict[str, list] = {}
-        for chunk in chunks:
-            docs.setdefault(chunk["filename"], []).append(chunk)
-
+        # Construir el contexto con números de cita [N]
         parts = ["=== Resultados en documentos locales ==="]
-        for filename, doc_chunks in docs.items():
-            doc_chunks.sort(key=lambda x: x["chunk_index"])
-            parts.append(f"\n[Documento: {filename}]")
-            for chunk in doc_chunks:
-                page = f" (pág. {chunk['page_number']})" if chunk.get("page_number") else ""
-                parts.append(f"Relevancia: {chunk['score']:.2f}{page}")
-                parts.append(chunk["content"])
+        parts.append("IMPORTANTE: Cita el número [N] en tu respuesta cuando uses este fragmento.\n")
 
-        sources = [
-            {
-                "chunk_id": c["id"],
-                "filename": c["filename"],
-                "page_number": c.get("page_number"),
-                "score": round(c["score"], 3),
-                "excerpt": c["content"][:200] + "..." if len(c["content"]) > 200 else c["content"],
-                "source_type": "document",
-            }
-            for c in chunks
-        ]
+        sources = []
+        for i, chunk in enumerate(chunks, start=source_offset + 1):
+            page = f" (pág. {chunk['page_number']})" if chunk.get("page_number") else ""
+            method = chunk.get("search_method", "vector")
+            rerank_score = chunk.get("rerank_score")
+
+            parts.append(f"[{i}] {chunk['filename']}{page} | método: {method}"
+                         + (f" | rerank: {rerank_score:.2f}" if rerank_score is not None else ""))
+            parts.append(chunk["content"])
+            parts.append("")  # línea en blanco entre chunks
+
+            sources.append({
+                "citation_index": i,
+                "chunk_id": chunk["id"],
+                "filename": chunk["filename"],
+                "page_number": chunk.get("page_number"),
+                "score": round(chunk["score"], 3),
+                "rerank_score": round(rerank_score, 3) if rerank_score is not None else None,
+                "search_method": method,
+                "excerpt": chunk["content"][:300] + "..." if len(chunk["content"]) > 300 else chunk["content"],
+            })
 
         return "\n".join(parts), sources
 
@@ -279,11 +351,17 @@ class AgenticRAGService:
         messages: list[dict],
         use_tools: bool = True,
     ):
+        if use_tools:
+            clean_messages = [m for m in messages if not (isinstance(m, dict) and "_direct_answer" in m)]
+        else:
+            # Para la síntesis final sin tools, limpiar tool_calls del historial
+            clean_messages = _build_synthesis_messages(messages)
+
         kwargs = {
-            "model": "openai/gpt-oss-120b",  # Modelo recomendado por Groq para tool calling
-            "messages": messages,
+            "model": "openai/gpt-oss-120b",
+            "messages": clean_messages,
             "max_tokens": 1024,
-            "temperature": 0.2,  # Groq recomienda 0.0-0.5 para tool calling
+            "temperature": 0.2,
         }
 
         if use_tools:
@@ -297,6 +375,93 @@ class AgenticRAGService:
             tool_calls=len(response.choices[0].message.tool_calls or []),
         )
         return response
+
+    async def _stream_final_answer(self, messages: list[dict]) -> AsyncGenerator[str, None]:
+        if messages and isinstance(messages[-1], dict) and messages[-1].get("_direct_answer"):
+            content = messages[-1].get("_content", "")
+            for chunk in _split_into_chunks(content):
+                yield chunk
+            return
+
+        synthesis_messages = _build_synthesis_messages(messages)
+
+        stream = await self.groq_client.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            messages=synthesis_messages,
+            max_tokens=1024,
+            temperature=0.2,
+            stream=True,
+        )
+
+        async for chunk in stream:
+            delta = chunk.choices[0].delta
+            if delta.content:
+                yield delta.content
+
+
+def _split_into_chunks(text: str, size: int = 8) -> list[str]:
+    return [text[i:i+size] for i in range(0, len(text), size)]
+
+
+def _build_synthesis_messages(messages: list[dict]) -> list[dict]:
+    """
+    Prepara el historial para la llamada de síntesis final (sin tools).
+
+    El problema: cuando el agente ha usado tools, el historial contiene:
+      - Mensajes role=assistant con tool_calls (el LLM pidiendo una tool)
+      - Mensajes role=tool con los resultados
+
+    Si enviamos eso a Groq con tool_choice=none o sin tools definidas,
+    Groq rechaza la llamada porque ve tool_calls en el historial pero
+    no hay tools disponibles para ejecutarlas.
+
+    Solución: reconstruir el historial convirtiendo los bloques
+    tool_call + tool_result en un único mensaje role=assistant con
+    el contenido de los resultados incrustado como texto. Así el LLM
+    tiene toda la información pero sin la estructura de tool_calls.
+    """
+    result = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+
+        # Saltar marcadores internos
+        if isinstance(msg, dict) and "_direct_answer" in msg:
+            i += 1
+            continue
+
+        # Mensaje de assistant con tool_calls → convertir en texto
+        if (isinstance(msg, dict)
+                and msg.get("role") == "assistant"
+                and msg.get("tool_calls")):
+
+            # Recoger los resultados de todas las tools llamadas
+            tool_results = []
+            j = i + 1
+            while j < len(messages) and messages[j].get("role") == "tool":
+                tool_results.append(
+                    f"[Resultado de {messages[j].get('name', 'tool')}]:\n{messages[j].get('content', '')}"
+                )
+                j += 1
+
+            # Sustituir el bloque entero por un mensaje de contexto limpio
+            combined = "\n\n".join(tool_results)
+            result.append({
+                "role": "assistant",
+                "content": f"He consultado las fuentes y obtenido la siguiente información:\n\n{combined}",
+            })
+            i = j  # saltar los mensajes role=tool que ya procesamos
+            continue
+
+        # Mensajes role=tool sueltos (sin assistant previo) → descartar
+        if isinstance(msg, dict) and msg.get("role") == "tool":
+            i += 1
+            continue
+
+        result.append(msg)
+        i += 1
+
+    return result
 
 
 _rag_service: AgenticRAGService | None = None

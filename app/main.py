@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
-from app.api.routes import chat, documents, health
+from app.api.routes import chat, documents, health, evaluation
 from app.core.config import settings
 from app.core.logging import get_logger, setup_logging
 
@@ -82,6 +82,7 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(documents.router)
 app.include_router(chat.router)
+app.include_router(evaluation.router)
 
 
 # ─── Root ─────────────────────────────────────────────────────────────────────

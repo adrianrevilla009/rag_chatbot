@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     # ─── Groq ─────────────────────────────────────────────────────────────
     groq_api_key: str = Field(default="")
     groq_model: str = Field(default="openai/gpt-oss-120b")
+
+    # ─── Web Search ───────────────────────────────────────────────────────
+    tavily_api_key: str = Field(default="")
+    # Consigue tu key gratis en https://tavily.com (1.000 búsquedas/mes)
+    # Si está vacía, el sistema usa DuckDuckGo como fallback automático.
     # llama3-groq-70b-8192-tool-use-preview: modelo de Groq fine-tuneado
     # específicamente para tool calling. llama-3.3-70b-versatile genera el
     # tool call en formato <function=...> incorrecto en vez de JSON estándar.
