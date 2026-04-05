@@ -1,0 +1,44 @@
+{
+  "title": "RAG Chatbot — Overview",
+  "uid": "rag-overview",
+  "schemaVersion": 38,
+  "refresh": "30s",
+  "panels": [
+    {
+      "title": "Requests / min",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+      "targets": [{"expr": "rate(rag_http_requests_total[1m]) * 60", "legendFormat": "req/min"}]
+    },
+    {
+      "title": "Error Rate",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+      "targets": [{"expr": "rate(rag_http_requests_total{status_code=~'5..'}[5m]) / rate(rag_http_requests_total[5m])", "legendFormat": "error rate"}]
+    },
+    {
+      "title": "Cache Hit Ratio",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+      "targets": [{"expr": "rag_cache_hit_ratio", "legendFormat": "hit ratio"}]
+    },
+    {
+      "title": "P95 Latency (s)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+      "targets": [{"expr": "histogram_quantile(0.95, rate(rag_http_request_duration_seconds_bucket[5m]))", "legendFormat": "p95"}]
+    },
+    {
+      "title": "Request Rate by Endpoint",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "targets": [{"expr": "rate(rag_http_requests_total[5m])", "legendFormat": "{{endpoint}}"}]
+    },
+    {
+      "title": "LLM Tokens Used",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "targets": [{"expr": "rate(rag_llm_tokens_total[5m])", "legendFormat": "{{type}}"}]
+    }
+  ]
+}
